@@ -1,50 +1,132 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
-// Authored note: this router fans out to REST v3, GraphQL v4, MCP and git smart HTTP modules.
-
+// The forge's HTTP front door: one node:http server over the in-memory Forge, routing the REST v3
+// surface, GraphQL v4, the MCP endpoint, git smart HTTP and the env's boot probe, and answering
+// GitHub's JSON 404 for everything else.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { Forge } from './store.ts';
+import { handleRest, isRestPath } from './rest.ts';
+import { handleMcp } from './mcp.ts';
+import { handleGraphQL } from './graphql.ts';
+import { handleGitHttp } from './githttp.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
+function requestId(): string {
+  const hex = '0123456789abcdef';
+  let out = '';
+  for (let i = 0; i < 32; i += 1) {
+    if (i === 8 || i === 12 || i === 16 || i === 20) out += '-';
+    out += hex[Math.floor(Math.random() * 16)];
+  }
+  return out;
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  if (res.headersSent) return;
+  const text = body === undefined ? '' : JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': requestId(),
+    ...headers,
+  });
   res.end(text);
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
+  const forge = new Forge();
+  return createServer((req, res) => {
+    void (async () => {
+      try {
+        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+        const pathname = url.pathname;
+        const origin = `${url.protocol}//${url.host}`;
+        const method = (req.method ?? 'GET').toUpperCase();
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
+        if (pathname === '/healthz') {
+          sendJson(res, 200, { ok: true });
+          return;
+        }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
+        if (isRestPath(pathname)) {
+          const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+          const answer = handleRest(forge, method, url, body, origin, req.headers.authorization ?? null);
+          if (answer === null) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
+          res.writeHead(answer.status, {
+            'content-type': 'application/json; charset=utf-8',
+            'x-github-request-id': requestId(),
+            ...answer.headers,
+          });
+          res.end(answer.body === undefined ? '' : JSON.stringify(answer.body));
+          return;
+        }
 
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+        if (pathname === '/api/graphql' || pathname === '/graphql') {
+          const body = await readBody(req);
+          if (method !== 'POST') {
+            sendJson(res, 405, { message: 'Method Not Allowed' });
+            return;
+          }
+          if (req.headers.authorization === undefined || !/^Bearer\s+\S+/i.test(req.headers.authorization.trim())) {
+            sendJson(res, 401, { message: 'Requires authentication' });
+            return;
+          }
+          const answer = handleGraphQL(forge, body.toString('utf8'));
+          sendJson(res, answer.status, answer.body, answer.headers);
+          return;
+        }
+
+        if (pathname === '/mcp') {
+          const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
+          const answer = handleMcp(forge, body.toString('utf8'), method, req.headers.authorization ?? null);
+          if (answer === null) {
+            res.writeHead(202);
+            res.end();
+            return;
+          }
+          res.writeHead(answer.status, { 'content-type': answer.contentType, ...answer.headers });
+          res.end(answer.body);
+          return;
+        }
+
+        if (/\/info\/refs$/.test(pathname) || /\/(git-upload-pack|git-receive-pack)$/.test(pathname)) {
+          const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
+          const protocol = /(?:^|\s)version=2(?:\s|$)/.test(String(req.headers['git-protocol'] ?? ''));
+          const answer = handleGitHttp(forge, method, url, body, protocol);
+          if (answer !== null) {
+            res.writeHead(answer.status, { 'content-type': answer.contentType, ...answer.headers });
+            res.end(answer.body);
+            return;
+          }
+        }
+
+        sendJson(res, 404, { message: 'Not Found' });
+      } catch {
+        try {
+          sendJson(res, 500, { message: 'Internal Server Error' });
+        } catch {
+          // the socket is already gone; nothing to answer
+        }
+      }
+    })();
   });
 }

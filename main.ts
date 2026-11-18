@@ -16,6 +16,7 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 // Authored note: the entry is a forge — bind, register, serve every request until the env says done.
+// Authored: the forge itself lives in the modules beside this file; this lifecycle only carries it.
 
 import { createApp } from './app.ts';
 
