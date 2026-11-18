@@ -4,6 +4,7 @@
 //
 // app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
 // entry <-> env lifecycle and should stay as it is.
+// Authored note: this router fans out to REST v3, GraphQL v4, MCP and git smart HTTP modules.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
